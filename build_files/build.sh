@@ -13,6 +13,21 @@ if ! rpm -q iio-sensor-proxy; then
     dnf5 install -y iio-sensor-proxy
 fi
 
+# bootc-image-builder resolves installer RPMs outside the target container.
+# Terra's release RPMs use container-local file:// GPG key paths, even though
+# each repository publishes the corresponding key at its HTTPS root. Rewrite
+# only those key URLs so external image builders can retain GPG verification.
+terra_repo_files=(/etc/yum.repos.d/terra*.repo)
+if [[ -e "${terra_repo_files[0]}" ]]; then
+    sed -Ei \
+        's#^gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-(terra.+)$#gpgkey=https://repos.fyralabs.com/\1/key.asc#' \
+        "${terra_repo_files[@]}"
+fi
+if grep -Rqs '^gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-terra' /etc/yum.repos.d; then
+    echo "A Terra repository still has a container-local GPG key URL" >&2
+    exit 1
+fi
+
 # Validate the installed-image integration before publishing it.
 test -x /usr/libexec/kootigers-touchscreen
 test -x /usr/bin/kootigers-touchscreen-diagnose
