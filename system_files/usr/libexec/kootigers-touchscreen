@@ -1,0 +1,139 @@
+#!/usr/bin/bash
+
+# KooTigers Goodix GDIX1002 initialization.
+# Adapted from PiercingXX/arch-mini-mod (MIT); see THIRD_PARTY_NOTICES.md.
+set -uo pipefail
+
+readonly DEVICE_PATH="/sys/bus/i2c/devices/i2c-GDIX1002:00"
+readonly MAX_DEVICE_WAIT_SECONDS=30
+
+log() {
+    printf 'kootigers-touchscreen: %s\n' "$*"
+}
+
+warn() {
+    printf 'kootigers-touchscreen: WARNING: %s\n' "$*" >&2
+}
+
+find_parent_pci_device() {
+    local current candidate
+
+    current="$(readlink -f "$DEVICE_PATH" 2>/dev/null || true)"
+    while [[ -n "$current" && "$current" != "/" ]]; do
+        candidate="${current##*/}"
+        if [[ "$candidate" =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[[:xdigit:]]$ ]] &&
+            [[ -d "/sys/bus/pci/devices/$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        current="${current%/*}"
+        [[ -n "$current" ]] || current="/"
+    done
+
+    return 1
+}
+
+set_runtime_power_on() {
+    if [[ -w "$DEVICE_PATH/power/control" ]]; then
+        if printf 'on\n' >"$DEVICE_PATH/power/control"; then
+            log "Runtime power control set to on"
+        else
+            warn "Could not set $DEVICE_PATH/power/control to on"
+        fi
+    else
+        warn "$DEVICE_PATH/power/control is unavailable or not writable"
+    fi
+}
+
+unload_module() {
+    local module="$1"
+
+    if lsmod | awk -v name="$module" 'NR > 1 && $1 == name { found = 1 } END { exit !found }'; then
+        if modprobe -r "$module"; then
+            log "Unloaded kernel module $module"
+        else
+            warn "Could not unload kernel module $module; continuing"
+        fi
+    fi
+}
+
+load_module() {
+    local module="$1"
+
+    if modprobe "$module"; then
+        log "Loaded kernel module $module"
+    else
+        warn "Could not load kernel module $module; continuing"
+    fi
+}
+
+if (( EUID != 0 )); then
+    warn "This helper must run as root"
+    exit 0
+fi
+
+log "Waiting up to ${MAX_DEVICE_WAIT_SECONDS}s for $DEVICE_PATH"
+for ((second = 0; second < MAX_DEVICE_WAIT_SECONDS; second++)); do
+    [[ -e "$DEVICE_PATH" ]] && break
+    sleep 1
+done
+
+if [[ ! -e "$DEVICE_PATH" ]]; then
+    warn "Goodix GDIX1002 device did not appear; leaving boot unaffected"
+    exit 0
+fi
+
+log "Found device at $(readlink -f "$DEVICE_PATH")"
+pci_device="$(find_parent_pci_device || true)"
+if [[ -n "$pci_device" ]]; then
+    log "Parent PCI function is $pci_device"
+else
+    warn "No parent PCI function was found in the device path"
+fi
+
+set_runtime_power_on
+
+# Preserve the community workaround's reload behavior. i2c_hid_acpi is the
+# current ACPI transport module and is handled explicitly when present.
+for module in hid_multitouch goodix_ts i2c_hid_acpi i2c_hid; do
+    unload_module "$module"
+done
+for module in i2c_hid i2c_hid_acpi goodix_ts hid_multitouch; do
+    load_module "$module"
+done
+
+if [[ -n "$pci_device" ]]; then
+    driver_link="/sys/bus/pci/devices/$pci_device/driver"
+    if [[ -L "$driver_link" ]]; then
+        driver_name="$(basename "$(readlink -f "$driver_link")")"
+        driver_path="/sys/bus/pci/drivers/$driver_name"
+        log "Resetting $pci_device through PCI driver $driver_name"
+
+        if ! printf '%s' "$pci_device" >"$driver_path/unbind"; then
+            warn "Failed to unbind $pci_device from $driver_name"
+        fi
+        sleep 1
+        if ! printf '%s' "$pci_device" >"$driver_path/bind"; then
+            warn "Failed to bind $pci_device to $driver_name"
+        fi
+    else
+        warn "Parent PCI function $pci_device has no bound driver"
+    fi
+fi
+
+udevadm settle --timeout=5 || warn "udevadm settle did not complete cleanly"
+for ((second = 0; second < 10; second++)); do
+    [[ -e "$DEVICE_PATH" ]] && break
+    sleep 1
+done
+
+if [[ -e "$DEVICE_PATH" ]]; then
+    set_runtime_power_on
+    log "Goodix device is present after initialization"
+else
+    warn "Goodix device has not reappeared yet after initialization"
+fi
+
+log "Recent Goodix/I2C touchscreen kernel messages follow"
+dmesg 2>&1 | tail -n 120 | grep -Ei 'goodix|gdix|capacitive|i2c-[0-9]+|i2c_hid|hid-multitouch' || true
+log "Initialization completed"

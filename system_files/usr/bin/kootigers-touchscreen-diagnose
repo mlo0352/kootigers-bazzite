@@ -1,0 +1,67 @@
+#!/usr/bin/bash
+
+# Safe, read-only diagnostics for the KooTigers Goodix touchscreen integration.
+set -uo pipefail
+
+readonly DEVICE_PATH="/sys/bus/i2c/devices/i2c-GDIX1002:00"
+
+section() {
+    printf '\n== %s ==\n' "$1"
+}
+
+section "Goodix sysfs device"
+if [[ -e "$DEVICE_PATH" ]]; then
+    printf 'present: yes\nresolved path: %s\n' "$(readlink -f "$DEVICE_PATH")"
+    for attribute in power/control modalias name; do
+        if [[ -r "$DEVICE_PATH/$attribute" ]]; then
+            printf '%s: %s\n' "$attribute" "$(<"$DEVICE_PATH/$attribute")"
+        fi
+    done
+    if [[ -L "$DEVICE_PATH/driver" ]]; then
+        printf 'driver: %s\n' "$(basename "$(readlink -f "$DEVICE_PATH/driver")")"
+    fi
+else
+    printf 'present: no (%s does not exist)\n' "$DEVICE_PATH"
+fi
+
+section "Touchscreen service"
+systemctl is-enabled kootigers-touchscreen.service 2>&1 || true
+systemctl is-active kootigers-touchscreen.service 2>&1 || true
+systemctl --no-pager --full status kootigers-touchscreen.service 2>&1 || true
+
+section "Current-boot service journal"
+journalctl --no-pager -b -u kootigers-touchscreen.service -n 150 2>&1 || true
+
+section "Relevant loaded kernel modules"
+lsmod 2>&1 | awk 'NR == 1 || $1 ~ /^(goodix_ts|i2c_hid|i2c_hid_acpi|hid_multitouch)$/' || true
+
+section "Installed-kernel module availability"
+while IFS= read -r kernel_version; do
+    printf 'kernel %s:\n' "$kernel_version"
+    for module in goodix_ts i2c_hid i2c_hid_acpi hid_multitouch; do
+        if modinfo -k "$kernel_version" -F filename "$module" >/dev/null 2>&1; then
+            printf '  %-18s available\n' "$module"
+        else
+            printf '  %-18s MISSING\n' "$module"
+        fi
+    done
+done < <(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null)
+
+section "Relevant kernel messages"
+dmesg 2>&1 | grep -Ei 'goodix|gdix|capacitive|i2c-[0-9]+|i2c_hid|hid-multitouch' | tail -n 150 || true
+
+section "libinput touchscreen devices"
+if command -v libinput >/dev/null 2>&1; then
+    libinput list-devices 2>&1 | awk 'BEGIN { IGNORECASE = 1; RS = "" } /goodix|gdix|touchscreen/ { print $0 "\n" }' || true
+else
+    printf 'libinput command is not installed\n'
+fi
+
+section "IIO sensor proxy"
+rpm -q iio-sensor-proxy 2>&1 || true
+systemctl is-active iio-sensor-proxy.service 2>&1 || true
+if command -v busctl >/dev/null 2>&1; then
+    busctl --no-pager status net.hadess.SensorProxy 2>&1 || true
+fi
+
+printf '\nDiagnostics complete. Run with sudo if dmesg or input-device access was denied.\n'
